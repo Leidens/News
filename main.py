@@ -32,7 +32,16 @@ class TwitterMonitorBot(commands.Bot):
     
     async def on_ready(self):
         logger.info(f'{self.user} est connecté!')
-        self.monitor_twitter.start()
+        # Synchroniser les commandes au démarrage
+        try:
+            synced = await self.tree.sync()
+            logger.info(f"Synchronisé {len(synced)} slash commands")
+        except Exception as e:
+            logger.error(f"Erreur lors de la synchronisation: {e}")
+        
+        # Démarrer la surveillance Twitter
+        if not self.monitor_twitter.is_running():
+            self.monitor_twitter.start()
     
     async def on_guild_join(self, guild):
         """Initialise les paramètres par défaut pour un nouveau serveur"""
@@ -43,6 +52,19 @@ class TwitterMonitorBot(commands.Bot):
             'include_retweets': False,
             'filter_keywords': []
         }
+    
+    async def on_command_error(self, ctx, error):
+        """Gère les erreurs de commandes"""
+        if isinstance(error, commands.CommandNotFound):
+            await ctx.send(f"❌ Commande inconnue. Tapez `!ww aide` pour voir les commandes disponibles.")
+        else:
+            logger.error(f"Erreur de commande: {error}")
+            await ctx.send(f"❌ Une erreur s'est produite: {error}")
+    
+    @commands.command(name='test_simple')
+    async def test_simple(self, ctx):
+        """Commande de test basique"""
+        await ctx.send("✅ Le bot fonctionne ! Tapez `!ww aide` pour voir toutes les commandes.")
     
     @commands.command(name='setup')
     @commands.has_permissions(administrator=True)
