@@ -6,11 +6,6 @@ import json
 import re
 from datetime import datetime, timedelta
 import logging
-import os
-from dotenv import load_dotenv
-
-# Charger les variables d'environnement
-load_dotenv()
 
 # Configuration du logging
 logging.basicConfig(level=logging.INFO)
@@ -20,7 +15,8 @@ class TwitterMonitorBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
-        super().__init__(command_prefix='!ww ', intents=intents)
+        intents.guilds = True
+        super().__init__(command_prefix='!ww ', intents=intents, help_command=None)
         
         # Stockage en mémoire (pas de localStorage dans les bots Discord)
         self.monitored_accounts = {}  # {guild_id: {channel_id: [accounts]}}
@@ -303,7 +299,7 @@ class TwitterMonitorBot(commands.Bot):
                     except Exception as e:
                         logger.error(f"Erreur lors de la surveillance de @{account}: {e}")
     
-    @commands.command(name='help')
+    @commands.command(name='aide')
     async def help_command(self, ctx):
         """Affiche l'aide du bot"""
         embed = discord.Embed(
@@ -352,13 +348,13 @@ class TwitterMonitorBot(commands.Bot):
 if __name__ == "__main__":
     bot = TwitterMonitorBot()
     
-    # Le token sera fourni par Render via les variables d'environnement
+    # Configuration du token (à mettre dans les variables d'environnement)
+    import os
     TOKEN = os.getenv('DISCORD_BOT_TOKEN')
     
     if not TOKEN:
         print("❌ ERREUR: Token Discord manquant!")
-        print("Configurez la variable DISCORD_BOT_TOKEN dans Render")
+        print("Ajoutez votre token dans la variable d'environnement DISCORD_BOT_TOKEN")
         exit(1)
     
-    print("🚀 Démarrage du bot...")
     bot.run(TOKEN)
