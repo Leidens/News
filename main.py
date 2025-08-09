@@ -1,431 +1,554 @@
-import os
+import discord
+from discord.ext import commands, tasks
+import aiohttp
 import asyncio
+import feedparser
+import json
+import os
 import logging
 from datetime import datetime, timedelta
 
-import aiohttp
-import feedparser
-import discord
-from discord.ext import commands, tasks
-from dotenv import load_dotenv
-
-# ----------------------------------------------
-# Configuration & logging
-# ----------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-log = logging.getLogger("twitter_monitor")
-
-load_dotenv()  # charge les variables d'environnement depuis .env
-
+# Configuration du logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class TwitterMonitorBot(commands.Bot):
-    """
-    Bot Discord dédié à la surveillance de comptes Twitter.
-    Utilise le flux RSS de Nitter (https://nitter.net) pour éviter l'API officielle.
-    """
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.guilds = True
+        super().__init__(command_prefix="!ww ", intents=intents, help_command=None)
 
-    def __init__(self, *, command_prefix: str = "!ww ", intents: discord.Intents | None = None):
-        if intents is None:
-            intents = discord.Intents.default()
-            intents.message_content = True
-            intents.guilds = True
-
-        super().__init__(command_prefix=command_prefix, intents=intents, help_command=None)
-
-        # ------------------------------------------------------------------
-        # Stockage en mémoire (pas de persistance – à adapter si besoin)
-        # ------------------------------------------------------------------
-        self.monitored_accounts: dict[int, dict[int, set[str]]] = {}  # guild_id -> channel_id -> {accounts}
-        self.last_tweet_ids: dict[str, str] = {}                       # account_handle -> tweet_id
-        self.guild_settings: dict[int, dict] = {}                     # guild_id -> settings
-
-        # ------------------------------------------------------------------
-        # Accès aux comptes officiels (pour l’aide)
-        # ------------------------------------------------------------------
+        # Stockage en mémoire (adapté pour Render)
+        self.monitored_accounts = {}  # {guild_id: {channel_id: [accounts]}}
+        self.last_tweet_ids = {}      # {account: last_tweet_id}
+        self.guild_settings = {}      # {guild_id: settings}
+        
+        # Dictionnaire d'horodatage pour chaque guild
+        self._last_check = {}
+        
+        # Comptes officiels Wuthering Waves (pré-configurés)
         self.official_accounts = {
-            "Wuthering_Waves_Global": "@Wuthering_Waves_Global",
-            "Narushio_wuwa": "@Narushio_wuwa",
-            "WutheringWavesOfficialDiscord": "@WutheringWavesOfficialDiscord",
+            'Wuthering_Waves_Global': 'Compte officiel global',
+            'Narushio_wuwa': 'Développeur Narushio',
+            'WutheringWavesOfficialDiscord': 'Discord officiel'
         }
 
-    # -------------------------------------------------------------
-    #  Bot lifecycle
-    # -------------------------------------------------------------
     async def on_ready(self):
-        log.info(f"{self.user} connecté !")
+        logger.info(f"{self.user} est connecté!")
         try:
             synced = await self.tree.sync()
-            log.info(f"Synchronisé {len(synced)} slash commands.")
+            logger.info(f"Synchronisé {len(synced)} slash commands")
         except Exception as e:
-            log.error("Erreur de synchronisation des slash commands", exc_info=e)
-
+            logger.error(f"Erreur lors de la synchronisation: {e}")
+        
         if not self.monitor_twitter.is_running():
             self.monitor_twitter.start()
 
-    async def on_guild_join(self, guild: discord.Guild):
-        """Initialise les paramètres par défaut pour un nouveau serveur."""
+    async def on_guild_join(self, guild):
+        """Initialise les paramètres par défaut pour un nouveau serveur"""
         self.guild_settings[guild.id] = {
-            "check_interval": 300,          # secondes
+            "check_interval": 300,  # 5 minutes
+            "notification_role": None,
+            "embed_color": 0x00d4ff,  # Couleur Wuthering Waves
             "include_retweets": False,
-            "notification_role": None,      # rôle à mentionner
-            "embed_color": 0x00d4ff,
+            "filter_keywords": []
         }
+        logger.info(f"Bot ajouté au serveur: {guild.name}")
 
-    async def on_command_error(self, ctx: commands.Context, error):
-        """Gestion globale des erreurs de commandes."""
+    async def on_command_error(self, ctx, error):
+        """Gère les erreurs de commandes"""
         if isinstance(error, commands.CommandNotFound):
-            await ctx.send(
-                f"❌ Commande inconnue. Tapez `{self.command_prefix}aide` pour voir les commandes disponibles."
-            )
+            await ctx.send(f"❌ Commande inconnue. Tapez `!ww aide` pour voir les commandes disponibles.")
+        elif isinstance(error, commands.MissingPermissions):
+            await ctx.send("❌ Vous n'avez pas les permissions nécessaires pour cette commande.")
         else:
-            log.error("Erreur de commande", exc_info=error)
-            await ctx.send(f"❌ Une erreur s'est produite : {error}")
+            logger.error(f"Erreur de commande: {error}")
+            await ctx.send(f"❌ Une erreur s'est produite. Vérifiez les logs.")
 
-    # -------------------------------------------------------------
-    #  Commandes
-    # -------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # API Twitter via Nitter
+    # ------------------------------------------------------------------
+
+    async def get_latest_tweet(self, handle: str) -> dict | None:
+        """
+        Récupère le dernier tweet via Nitter RSS.
+        Méthode robuste qui évite l'API Twitter payante.
+        """
+        # Nitter instances (fallback si l'une ne marche pas)
+        nitter_instances = [
+            "https://nitter.net",
+            "https://nitter.it",
+            "https://nitter.privacydev.net"
+        ]
+        
+        for instance in nitter_instances:
+            url = f"{instance}/{handle}/rss"
+            try:
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+                    async with session.get(url) as resp:
+                        if resp.status != 200:
+                            continue
+                        
+                        text = await resp.text()
+                        feed = feedparser.parse(text)
+                        
+                        if not feed.entries:
+                            continue
+                            
+                        entry = feed.entries[0]
+                        
+                        # Extraire l'ID du tweet depuis l'URL
+                        tweet_id = None
+                        if hasattr(entry, 'id') and entry.id:
+                            tweet_id = entry.id.split("/")[-1]
+                        elif hasattr(entry, 'link') and entry.link:
+                            tweet_id = entry.link.split("/")[-1]
+                        
+                        if not tweet_id:
+                            continue
+                            
+                        return {
+                            "id": tweet_id,
+                            "url": entry.link.replace("nitter", "x.com").replace("twitter.com", "x.com"),
+                            "text": entry.title or entry.summary or "Nouveau tweet",
+                            "created_at": datetime.utcnow(),
+                            "author": handle,
+                            "instance_used": instance
+                        }
+                        
+            except Exception as e:
+                logger.warning(f"Échec {instance} pour @{handle}: {e}")
+                continue
+        
+        logger.error(f"Impossible de récupérer les tweets de @{handle} sur toutes les instances")
+        return None
+
+    async def send_tweet_notification(self, channel: discord.TextChannel, handle: str, tweet_data: dict, is_test=False):
+        """Envoie une notification de nouveau tweet"""
+        try:
+            guild = channel.guild
+            settings = self.guild_settings.get(guild.id, {})
+            role_id = settings.get("notification_role")
+            content = ""
+
+            # Mention du rôle si configuré
+            if role_id and not is_test:
+                role = guild.get_role(role_id)
+                if role:
+                    content += f"{role.mention} "
+
+            # Formatage du message
+            emoji = "🧪" if is_test else "📱"
+            test_prefix = "[TEST] " if is_test else ""
+            
+            content += f"{emoji} {test_prefix}Nouveau tweet de **@{handle}**:\n{tweet_data['url']}"
+            
+            # Ajouter des infos de debug en mode test
+            if is_test:
+                content += f"\n`Instance: {tweet_data.get('instance_used', 'Inconnue')}`"
+                content += f"\n`ID: {tweet_data['id']}`"
+            
+            await channel.send(content)
+            logger.info(f"Tweet notifié: @{handle} dans #{channel.name}")
+            
+        except Exception as e:
+            logger.error(f"Erreur lors de l'envoi de notification: {e}")
+
+    # ------------------------------------------------------------------
+    # Commandes
+    # ------------------------------------------------------------------
 
     @commands.command(name="test_simple")
-    async def test_simple(self, ctx: commands.Context):
-        """Commande de test basique."""
+    async def test_simple(self, ctx):
+        """Commande de test basique"""
         await ctx.send("✅ Le bot fonctionne ! Tapez `!ww aide` pour voir toutes les commandes.")
 
     @commands.command(name="setup")
     @commands.has_permissions(administrator=True)
-    async def setup_monitoring(
-        self,
-        ctx: commands.Context,
-        account_handle: str,
-        channel: discord.TextChannel | None = None,
-    ):
+    async def setup_monitoring(self, ctx, account_handle: str, channel: discord.TextChannel = None):
         """
-        Configure la surveillance d’un compte Twitter.
-        Usage : !ww setup @Wuthering_Waves_Global #news
+        Configure la surveillance d'un compte Twitter
+        Usage: !ww setup @Wuthering_Waves_Global #news-channel
         """
         if channel is None:
             channel = ctx.channel
 
-        account_handle = account_handle.lstrip("@")
-
-        guild_id, channel_id = ctx.guild.id, channel.id
-        self.monitored_accounts.setdefault(guild_id, {}).setdefault(channel_id, set())
-
-        if account_handle in self.monitored_accounts[guild_id][channel_id]:
-            await ctx.send(
-                f"❌ Le compte @{account_handle} est déjà surveillé dans {channel.mention}"
-            )
+        handle = account_handle.lstrip("@")
+        
+        # Test de connectivité au compte
+        await ctx.send(f"🔍 Vérification du compte @{handle}...")
+        test_tweet = await self.get_latest_tweet(handle)
+        if not test_tweet:
+            await ctx.send(f"❌ Impossible de trouver ou d'accéder au compte @{handle}. Vérifiez que le compte existe et est public.")
             return
 
-        self.monitored_accounts[guild_id][channel_id].add(account_handle)
+        guild_id = ctx.guild.id
+        chan_id = channel.id
+
+        # Initialiser les structures
+        if guild_id not in self.monitored_accounts:
+            self.monitored_accounts[guild_id] = {}
+        if chan_id not in self.monitored_accounts[guild_id]:
+            self.monitored_accounts[guild_id][chan_id] = []
+        if guild_id not in self.guild_settings:
+            await self.on_guild_join(ctx.guild)
+
+        # Vérifier les doublons
+        if handle in self.monitored_accounts[guild_id][chan_id]:
+            await ctx.send(f"❌ Le compte @{handle} est déjà surveillé dans {channel.mention}.")
+            return
+
+        # Ajouter à la surveillance
+        self.monitored_accounts[guild_id][chan_id].append(handle)
+        
+        # Mémoriser le dernier tweet pour éviter le spam au démarrage
+        self.last_tweet_ids[handle] = test_tweet["id"]
 
         embed = discord.Embed(
             title="✅ Surveillance configurée",
-            description=f"Le compte **@{account_handle}** sera maintenant surveillé dans {channel.mention}",
+            description=f"Le compte **@{handle}** sera désormais surveillé dans {channel.mention}",
             color=0x00d4ff,
         )
-        embed.add_field(name="Intervalle de vérification", value="5 minutes", inline=True)
-        embed.add_field(name="Prochaine vérification", value="Dans 5 minutes", inline=True)
-
+        embed.add_field(name="Intervalle", value=f"{self.guild_settings[guild_id]['check_interval']} secondes", inline=True)
+        embed.add_field(name="Dernier tweet détecté", value=f"`{test_tweet['id']}`", inline=True)
+        embed.add_field(name="Instance utilisée", value=f"`{test_tweet.get('instance_used', 'Inconnue')}`", inline=True)
+        
         await ctx.send(embed=embed)
 
     @commands.command(name="remove")
     @commands.has_permissions(administrator=True)
-    async def remove_monitoring(
-        self,
-        ctx: commands.Context,
-        account_handle: str,
-        channel: discord.TextChannel | None = None,
-    ):
-        """Retire un compte de la surveillance."""
+    async def remove_monitoring(self, ctx, account_handle: str, channel: discord.TextChannel = None):
+        """
+        Retire un compte de la surveillance
+        Usage: !ww remove @Wuthering_Waves_Global #news-channel
+        """
         if channel is None:
             channel = ctx.channel
 
-        account_handle = account_handle.lstrip("@")
-        guild_id, channel_id = ctx.guild.id, channel.id
+        handle = account_handle.lstrip("@")
+        guild_id = ctx.guild.id
+        chan_id = channel.id
 
         try:
-            self.monitored_accounts[guild_id][channel_id].remove(account_handle)
-            await ctx.send(f"✅ Le compte @{account_handle} n'est plus surveillé dans {channel.mention}")
+            self.monitored_accounts[guild_id][chan_id].remove(handle)
+            # Nettoyer le dernier ID mémorisé
+            if handle in self.last_tweet_ids:
+                del self.last_tweet_ids[handle]
+            await ctx.send(f"✅ Le compte @{handle} n'est plus surveillé dans {channel.mention}.")
         except (KeyError, ValueError):
-            await ctx.send(
-                f"❌ Le compte @{account_handle} n'était pas surveillé dans {channel.mention}"
-            )
+            await ctx.send(f"❌ Le compte @{handle} n'était pas surveillé dans {channel.mention}.")
 
     @commands.command(name="list")
-    async def list_monitored(self, ctx: commands.Context):
-        """Affiche tous les comptes surveillés sur ce serveur."""
+    async def list_monitored(self, ctx):
+        """Affiche tous les comptes surveillés sur ce serveur"""
         guild_id = ctx.guild.id
-        if not self.monitored_accounts.get(guild_id):
-            await ctx.send("❌ Aucun compte n'est actuellement surveillé sur ce serveur.")
+        
+        if guild_id not in self.monitored_accounts or not any(self.monitored_accounts[guild_id].values()):
+            await ctx.send("❌ Aucun compte surveillé sur ce serveur.")
             return
 
         embed = discord.Embed(
             title="📱 Comptes Twitter surveillés",
             color=0x00d4ff,
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.utcnow()
         )
-
-        for channel_id, accounts in self.monitored_accounts[guild_id].items():
+        
+        total_accounts = 0
+        for chan_id, accounts in self.monitored_accounts[guild_id].items():
             if not accounts:
                 continue
-            channel = self.get_channel(channel_id)
-            channel_name = channel.mention if channel else f"Canal supprimé ({channel_id})"
-            accounts_list = "\n".join([f"• @{acct}" for acct in sorted(accounts)])
+                
+            channel = self.get_channel(chan_id)
+            channel_name = f"#{channel.name}" if channel else f"Canal supprimé ({chan_id})"
+            accounts_list = "\n".join([f"• @{account}" for account in accounts])
+            
             embed.add_field(name=channel_name, value=accounts_list, inline=False)
-
+            total_accounts += len(accounts)
+        
+        embed.set_footer(text=f"Total: {total_accounts} compte(s) surveillé(s)")
         await ctx.send(embed=embed)
 
     @commands.command(name="settings")
     @commands.has_permissions(administrator=True)
-    async def configure_settings(self, ctx: commands.Context, setting: str | None = None, *, value: str | None = None):
-        """Configure les paramètres du bot."""
+    async def configure_settings(self, ctx, setting: str = None, *, value: str = None):
+        """
+        Configure les paramètres du bot
+        Usage: !ww settings interval 300
+        Usage: !ww settings retweets true
+        Usage: !ww settings role @News
+        """
         guild_id = ctx.guild.id
-        self.guild_settings.setdefault(guild_id, {
-            "check_interval": 300,
-            "include_retweets": False,
-            "notification_role": None,
-            "embed_color": 0x00d4ff,
-        })
+        
+        if guild_id not in self.guild_settings:
+            await self.on_guild_join(ctx.guild)
 
-        settings = self.guild_settings[guild_id]
-
+        # Afficher les paramètres actuels
         if setting is None:
-            # Afficher les paramètres actuels
+            settings = self.guild_settings[guild_id]
             embed = discord.Embed(title="⚙️ Paramètres actuels", color=0x00d4ff)
-            embed.add_field(name="Intervalle (s)", value=settings["check_interval"], inline=True)
-            embed.add_field(
-                name="Inclure retweets",
-                value=str(settings["include_retweets"]),
-                inline=True,
-            )
-            role = ctx.guild.get_role(settings["notification_role"]) if settings["notification_role"] else None
+            embed.add_field(name="Intervalle de vérification", value=f"{settings['check_interval']} secondes", inline=True)
+            embed.add_field(name="Inclure les retweets", value="Oui" if settings['include_retweets'] else "Non", inline=True)
+            
+            role = ctx.guild.get_role(settings['notification_role']) if settings['notification_role'] else None
             embed.add_field(name="Rôle de notification", value=role.mention if role else "Aucun", inline=True)
+            
+            embed.add_field(name="Commandes disponibles", value="""
+            `!ww settings interval 300` - Changer l'intervalle (en secondes, min 60)
+            `!ww settings retweets true/false` - Inclure les retweets
+            `!ww settings role @MonRole` - Définir le rôle à mentionner
+            """, inline=False)
+            
             await ctx.send(embed=embed)
             return
 
-        # Modification d’un paramètre
-        setting = setting.lower()
-        if setting == "interval":
-            try:
+        # Modifier un paramètre
+        try:
+            if setting.lower() == "interval":
                 interval = int(value)
                 if interval < 60:
-                    raise ValueError("Intervalle trop court")
-                settings["check_interval"] = interval
-                await ctx.send(f"✅ Intervalle mis à jour : {interval} secondes.")
-            except Exception as e:
-                await ctx.send(f"❌ Erreur : {e}")
-
-        elif setting == "retweets":
-            val = value.lower() in {"true", "1", "yes", "oui"}
-            settings["include_retweets"] = val
-            await ctx.send(f"✅ Retweets : {'Inclus' if val else 'Exclus'}.")
-
-        elif setting == "role":
-            if not (value and value.startswith("<@&") and value.endswith(">")):
-                await ctx.send("❌ Merci de mentionner un rôle valide (@role).")
-                return
-            role_id = int(value[3:-1])
-            role_obj = ctx.guild.get_role(role_id)
-            if role_obj is None:
-                await ctx.send("❌ Rôle introuvable.")
-                return
-            settings["notification_role"] = role_id
-            await ctx.send(f"✅ Rôle de notification : {role_obj.mention}")
-
-        else:
-            await ctx.send(f"❌ Paramètre inconnu : `{setting}`.")
+                    await ctx.send("❌ L'intervalle minimum est de 60 secondes pour éviter le spam.")
+                    return
+                self.guild_settings[guild_id]["check_interval"] = interval
+                await ctx.send(f"✅ Intervalle mis à jour: {interval} secondes")
+                
+            elif setting.lower() in ["retweets", "rt"]:
+                include_rt = value.lower() in ("true", "1", "yes", "oui", "on")
+                self.guild_settings[guild_id]["include_retweets"] = include_rt
+                await ctx.send(f"✅ Retweets: {'Inclus' if include_rt else 'Exclus'}")
+                
+            elif setting.lower() == "role":
+                if value.lower() in ["none", "aucun", "reset"]:
+                    self.guild_settings[guild_id]["notification_role"] = None
+                    await ctx.send("✅ Rôle de notification supprimé.")
+                elif value.startswith("<@&") and value.endswith(">"):
+                    try:
+                        role_id = int(value[3:-1])
+                        role = ctx.guild.get_role(role_id)
+                        if role:
+                            self.guild_settings[guild_id]["notification_role"] = role.id
+                            await ctx.send(f"✅ Rôle de notification: {role.mention}")
+                        else:
+                            await ctx.send("❌ Rôle introuvable.")
+                    except ValueError:
+                        await ctx.send("❌ ID de rôle invalide.")
+                else:
+                    await ctx.send("❌ Mentionnez un rôle valide (@role) ou tapez 'none' pour supprimer.")
+            else:
+                await ctx.send(f"❌ Paramètre inconnu: `{setting}`. Tapez `!ww settings` pour voir les options.")
+                
+        except ValueError:
+            await ctx.send("❌ Valeur invalide. Vérifiez le format de votre commande.")
 
     @commands.command(name="test")
     @commands.has_permissions(administrator=True)
-    async def test_monitoring(self, ctx: commands.Context, account_handle: str):
-        """Teste la surveillance d'un compte (récupère le dernier tweet)."""
-        account_handle = account_handle.lstrip("@")
-        await ctx.send(f"🔍 Test de surveillance pour @{account_handle}…")
-
-        tweet_data = await self.get_latest_tweet(account_handle)
-        if not tweet_data:
-            await ctx.send(f"❌ Impossible de récupérer les tweets de @{account_handle}.")
+    async def test_monitoring(self, ctx, account_handle: str):
+        """Teste la surveillance d'un compte (récupère le dernier tweet)"""
+        handle = account_handle.lstrip("@")
+        
+        await ctx.send(f"🔍 Test de surveillance pour @{handle}...")
+        
+        tweet = await self.get_latest_tweet(handle)
+        if not tweet:
+            await ctx.send(f"❌ Impossible de récupérer le dernier tweet de @{handle}. Vérifiez que le compte existe et est accessible.")
             return
+            
+        await self.send_tweet_notification(ctx.channel, handle, tweet, is_test=True)
 
-        await self.send_tweet_notification(ctx.channel, account_handle, tweet_data, is_test=True)
+    @commands.command(name="comptes")
+    async def suggest_accounts(self, ctx):
+        """Affiche les comptes officiels Wuthering Waves recommandés"""
+        embed = discord.Embed(
+            title="📱 Comptes officiels Wuthering Waves recommandés",
+            description="Voici les principaux comptes à surveiller :",
+            color=0x00d4ff
+        )
+        
+        for handle, description in self.official_accounts.items():
+            embed.add_field(
+                name=f"@{handle}",
+                value=f"{description}\n`!ww setup @{handle} #votre-canal`",
+                inline=False
+            )
+        
+        embed.set_footer(text="Utilisez !ww setup @compte #canal pour surveiller un compte")
+        await ctx.send(embed=embed)
+
+    @commands.command(name="status")
+    async def bot_status(self, ctx):
+        """Affiche le statut du bot et des surveillances actives"""
+        guild_id = ctx.guild.id
+        
+        # Compter les surveillances
+        total_accounts = 0
+        total_channels = 0
+        if guild_id in self.monitored_accounts:
+            for accounts in self.monitored_accounts[guild_id].values():
+                if accounts:
+                    total_channels += 1
+                    total_accounts += len(accounts)
+        
+        embed = discord.Embed(
+            title="📊 Statut du Bot",
+            color=0x00d4ff,
+            timestamp=datetime.utcnow()
+        )
+        
+        embed.add_field(name="🤖 Bot", value="En ligne", inline=True)
+        embed.add_field(name="📱 Comptes surveillés", value=total_accounts, inline=True)
+        embed.add_field(name="📺 Canaux configurés", value=total_channels, inline=True)
+        
+        settings = self.guild_settings.get(guild_id, {})
+        embed.add_field(name="⏱️ Intervalle", value=f"{settings.get('check_interval', 300)}s", inline=True)
+        embed.add_field(name="🔄 Retweets", value="Oui" if settings.get('include_retweets', False) else "Non", inline=True)
+        embed.add_field(name="🏓 Surveillance", value="Active" if self.monitor_twitter.is_running() else "Inactive", inline=True)
+        
+        # Dernière vérification
+        last_check = self._last_check.get(guild_id)
+        if last_check:
+            time_since = datetime.utcnow() - last_check
+            embed.add_field(name="🕒 Dernière vérification", value=f"Il y a {int(time_since.total_seconds())}s", inline=True)
+        
+        await ctx.send(embed=embed)
 
     @commands.command(name="aide")
-    async def help_command(self, ctx: commands.Context):
-        """Affiche l'aide du bot."""
+    async def help_command(self, ctx):
+        """Affiche l'aide du bot"""
         embed = discord.Embed(
-            title="🤖 Wuthering Waves Twitter Bot",
-            description="Bot de surveillance des comptes Twitter officiels de Wuthering Waves.",
-            color=0x00d4ff,
+            title="🤖 Wuthering Waves Twitter Monitor",
+            description="Bot de surveillance automatique des comptes Twitter officiels de Wuthering Waves",
+            color=0x00d4ff
         )
-
+        
         embed.add_field(
             name="📋 Commandes principales",
             value="""
-`!ww setup @compte #canal` - Configure la surveillance
-`!ww remove @compte #canal` - Retire la surveillance  
-`!ww list` - Liste les comptes surveillés
-`!ww settings` - Affiche les paramètres actuels
-`!ww test @compte` - Test de surveillance
-""",
-            inline=False,
+            `!ww setup @compte #canal` - Surveiller un compte
+            `!ww remove @compte #canal` - Arrêter la surveillance  
+            `!ww list` - Voir les comptes surveillés
+            `!ww test @compte` - Tester un compte
+            `!ww comptes` - Comptes officiels suggérés
+            """,
+            inline=False
         )
+        
         embed.add_field(
-            name="⚙️ Configuration avancée",
+            name="⚙️ Configuration",
             value="""
-`!ww settings interval 300` - Intervalle en secondes (minimum 60)
-`!ww settings retweets true` - Inclure les retweets
-`!ww settings role @News` - Rôle à mentionner lors d’une notification
-""",
-            inline=False,
+            `!ww settings` - Voir les paramètres actuels
+            `!ww settings interval 300` - Changer l'intervalle (secondes)
+            `!ww settings retweets true` - Inclure les retweets
+            `!ww settings role @News` - Rôle à mentionner
+            """,
+            inline=False
         )
+        
         embed.add_field(
-            name="📱 Comptes officiels suggérés",
-            value="\n".join(self.official_accounts.values()),
-            inline=False,
+            name="📊 Informations",
+            value="""
+            `!ww status` - Statut du bot
+            `!ww aide` - Afficher cette aide
+            """,
+            inline=False
         )
-        embed.set_footer(text="Développé pour la communauté Wuthering Waves")
+        
+        embed.set_footer(text="Hébergé gratuitement sur Render • Développé pour la communauté WW")
+        
         await ctx.send(embed=embed)
 
-    # -------------------------------------------------------------
-    #  Core logic
-    # -------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Tâche de surveillance
+    # ------------------------------------------------------------------
 
-    async def get_latest_tweet(self, account_handle: str) -> dict | None:
-        """
-        Récupère le dernier tweet d’un compte via Nitter RSS.
-        Retourne un dictionnaire contenant id, url, text, created_at et author.
-        """
-        nitter_url = f"https://nitter.net/{account_handle}/rss"
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(nitter_url) as resp:
-                    if resp.status != 200:
-                        log.warning(f"RSS {nitter_url} retourné {resp.status}")
-                        return None
-                    raw = await resp.text()
-
-            feed = feedparser.parse(raw)
-            if not feed.entries:
-                log.debug(f"Aucun tweet trouvé pour @{account_handle}.")
-                return None
-
-            entry = feed.entries[0]  # le plus récent
-            tweet_id = entry.id.split("/")[-1]
-            tweet_url = entry.link
-            tweet_text = entry.title  # title contient le texte du tweet
-            created_at = datetime.strptime(entry.published, "%a, %d %b %Y %H:%M:%S %z")
-            return {
-                "id": tweet_id,
-                "url": tweet_url,
-                "text": tweet_text,
-                "created_at": created_at,
-                "author": account_handle,
-            }
-
-        except Exception as e:
-            log.error(f"Erreur lors de la récupération du tweet pour @{account_handle}", exc_info=e)
-            return None
-
-    async def send_tweet_notification(
-        self, channel: discord.TextChannel, account_handle: str, tweet_data: dict, *, is_test=False
-    ):
-        """Envoie une notification dans Discord."""
-        try:
-            # Mention de rôle si configuré
-            guild_settings = self.guild_settings.get(channel.guild.id, {})
-            role_id = guild_settings.get("notification_role")
-            mention = ""
-            if role_id and not is_test:
-                role_obj = channel.guild.get_role(role_id)
-                if role_obj:
-                    mention = f"{role_obj.mention} "
-
-            # Titre
-            title = "🧪 [TEST] Nouveau tweet" if is_test else "📱 Nouveau tweet"
-
-            embed = discord.Embed(
-                title=title,
-                description=f"[@{account_handle}]({tweet_data['url']})\n\n{tweet_data['text']}",
-                color=guild_settings.get("embed_color", 0x00d4ff),
-                timestamp=tweet_data["created_at"],
-            )
-            embed.set_footer(text="Twitter via Nitter")
-
-            await channel.send(mention + embed.to_dict()["title"], embed=embed)
-        except Exception as e:
-            log.error(f"Erreur lors de l'envoi d'une notification", exc_info=e)
-
-    # -------------------------------------------------------------
-    #  Monitoring loop
-    # -------------------------------------------------------------
-
-    @tasks.loop(seconds=60.0)  # vérifie chaque minute (le check_interval décide du délai réel)
+    @tasks.loop(seconds=60)  # Vérification toutes les minutes
     async def monitor_twitter(self):
-        """Boucle principale de surveillance."""
+        """Boucle principale de surveillance des comptes Twitter"""
         now = datetime.utcnow()
+        
         for guild_id, channels in self.monitored_accounts.items():
+            # Vérifier si c'est le moment de checker selon l'intervalle configuré
             settings = self.guild_settings.get(guild_id, {})
-            interval_sec = settings.get("check_interval", 300)
+            interval = settings.get("check_interval", 300)
 
-            # Vérifie si l'intervalle est respecté
-            last_check_key = f"_last_checked_{guild_id}"
-            if getattr(self, last_check_key, None):
-                elapsed = (now - getattr(self, last_check_key)).total_seconds()
-                if elapsed < interval_sec:
+            last_check = self._last_check.get(guild_id, now - timedelta(seconds=interval))
+            if (now - last_check).total_seconds() < interval:
+                continue
+
+            # Mettre à jour le timestamp
+            self._last_check[guild_id] = now
+            logger.info(f"Vérification des tweets pour le serveur {guild_id}")
+
+            for chan_id, accounts in channels.items():
+                if not accounts:
                     continue
 
-            # Met à jour le timestamp de la dernière vérification
-            setattr(self, last_check_key, now)
-
-            for channel_id, accounts in channels.items():
-                channel = self.get_channel(channel_id)
+                channel = self.get_channel(chan_id)
                 if not channel:
-                    continue  # canal inexistant (ex: supprimé depuis)
+                    logger.warning(f"Canal {chan_id} introuvable, nettoyage recommandé")
+                    continue
 
-                for account in accounts:
+                for handle in accounts:
                     try:
-                        tweet_data = await self.get_latest_tweet(account)
-                        if not tweet_data:
+                        tweet = await self.get_latest_tweet(handle)
+                        if not tweet:
+                            logger.warning(f"Pas de tweet récupéré pour @{handle}")
                             continue
 
-                        last_id = self.last_tweet_ids.get(account)
-                        if tweet_data["id"] == last_id:
-                            continue  # pas de nouveau tweet
+                        # Vérifier si c'est un nouveau tweet
+                        last_id = self.last_tweet_ids.get(handle)
+                        if tweet["id"] != last_id:
+                            # Filtrer les retweets si nécessaire
+                            if not settings.get("include_retweets", False):
+                                if tweet["text"].lower().startswith(("rt @", "retweet")):
+                                    logger.info(f"Retweet ignoré de @{handle}: {tweet['id']}")
+                                    self.last_tweet_ids[handle] = tweet["id"]  # Marquer comme vu
+                                    continue
 
-                        # Vérification du filtre retweets
-                        include_retweets = settings.get("include_retweets", False)
-                        is_retweet = tweet_data["text"].startswith("RT ")
-                        if not include_retweets and is_retweet:
-                            self.last_tweet_ids[account] = tweet_data["id"]
-                            continue
-
-                        await self.send_tweet_notification(channel, account, tweet_data)
-                        self.last_tweet_ids[account] = tweet_data["id"]
+                            await self.send_tweet_notification(channel, handle, tweet)
+                            self.last_tweet_ids[handle] = tweet["id"]
+                            
+                            # Anti-spam entre les notifications
+                            await asyncio.sleep(2)
 
                     except Exception as e:
-                        log.error(f"Erreur de surveillance pour @{account}", exc_info=e)
+                        logger.error(f"Erreur lors de la surveillance de @{handle}: {e}")
 
-                # Petite pause entre les comptes pour éviter le spam
-                await asyncio.sleep(2)
+                # Anti-spam entre les comptes
+                await asyncio.sleep(1)
 
+    @monitor_twitter.before_loop
+    async def before_monitor_twitter(self):
+        """Attendre que le bot soit prêt avant de commencer la surveillance"""
+        await self.wait_until_ready()
+        logger.info("Surveillance Twitter démarrée")
 
-# -------------------------------------------------------------
-#  Entrée principale
-# -------------------------------------------------------------
+    @monitor_twitter.error
+    async def monitor_twitter_error(self, error):
+        """Gère les erreurs de la boucle de surveillance"""
+        logger.error(f"Erreur dans la boucle de surveillance: {error}")
+        # Redémarrer la boucle après une pause
+        await asyncio.sleep(60)
+        if not self.monitor_twitter.is_running():
+            self.monitor_twitter.restart()
+
+# ------------------------------------------------------------------
+# Point d'entrée du bot
+# ------------------------------------------------------------------
+
 if __name__ == "__main__":
     bot = TwitterMonitorBot()
-
+    
+    # Configuration du token depuis les variables d'environnement
     token = os.getenv("DISCORD_BOT_TOKEN")
     if not token:
-        raise RuntimeError(
-            "❌ Impossible de démarrer le bot : DISCORD_BOT_TOKEN manquant dans les variables d'environnement."
-        )
-
+        logger.error("❌ ERREUR: Token Discord manquant!")
+        logger.error("Ajoutez votre token dans la variable d'environnement DISCORD_BOT_TOKEN")
+        raise RuntimeError("La variable d'environnement DISCORD_BOT_TOKEN est manquante.")
+    
+    logger.info("🚀 Démarrage du bot Wuthering Waves Twitter Monitor...")
+    
     try:
         bot.run(token)
-    except KeyboardInterrupt:
-        log.info("Arrêt du bot demandé (Ctrl+C).")
-
+    except Exception as e:
+        logger.error(f"❌ Erreur critique lors du démarrage: {e}")
+        raise
